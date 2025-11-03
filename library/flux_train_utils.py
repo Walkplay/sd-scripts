@@ -90,7 +90,15 @@ def sample_images(
         # If only one device is available, just use the original prompt list. We don't need to care about the distribution of prompts.
         with torch.no_grad(), accelerator.autocast():
             for prompt_dict in prompts:
-                sample_image_inference(
+                # Decide which inference function to use
+                if prompt_dict.get("init_image") and os.path.isfile(prompt_dict.get("init_image")):
+                    logger.info("Using img2img inference.")
+                    sample_func = sample_img2img_inference
+                else:
+                    logger.info("Using txt2img inference.")
+                    sample_func = sample_image_inference
+                
+                sample_func( 
                     accelerator,
                     args,
                     flux,
@@ -114,7 +122,15 @@ def sample_images(
         with torch.no_grad():
             with distributed_state.split_between_processes(per_process_prompts) as prompt_dict_lists:
                 for prompt_dict in prompt_dict_lists[0]:
-                    sample_image_inference(
+                    # Decide which inference function to use
+                    if prompt_dict.get("init_image") and os.path.isfile(prompt_dict.get("init_image")):
+                        logger.info("Using img2img inference.")
+                        sample_func = sample_img2img_inference
+                    else:
+                        logger.info("Using txt2img inference.")
+                        sample_func = sample_image_inference
+                    
+                    sample_func( 
                         accelerator,
                         args,
                         flux,
@@ -134,6 +150,228 @@ def sample_images(
         torch.cuda.set_rng_state(cuda_rng_state)
 
     clean_memory_on_device(accelerator.device)
+
+
+def sample_img2img_inference(
+    accelerator: Accelerator,
+    args: argparse.Namespace,
+    flux: flux_models.Flux,
+    text_encoders: Optional[List[CLIPTextModel]],
+    ae: flux_models.AutoEncoder,
+    save_dir,
+    prompt_dict,
+    epoch,
+    steps,
+    sample_prompts_te_outputs,
+    prompt_replacement,
+    controlnet,
+):
+    assert isinstance(prompt_dict, dict)
+    negative_prompt = prompt_dict.get("negative_prompt")
+    sample_steps = prompt_dict.get("sample_steps", 20)
+    width = prompt_dict.get("width", 512)
+    height = prompt_dict.get("height", 512)
+    emb_guidance_scale = prompt_dict.get("guidance_scale", 3.5)
+    cfg_scale = prompt_dict.get("scale", 1.0)
+    seed = prompt_dict.get("seed")
+    controlnet_image = prompt_dict.get("controlnet_image")
+    prompt: str = prompt_dict.get("prompt", "")
+    # sampler_name: str = prompt_dict.get("sample_sampler", args.sample_sampler)
+
+    # --- New parameters for Img2Img ---
+    init_image_path = prompt_dict.get("init_image")
+    denoising_strength = prompt_dict.get("denoising_strength", 0.8)
+
+    if not init_image_path or not os.path.isfile(init_image_path):
+        logger.error(
+            f"Image-to-image requires 'init_image' in prompt_dict, but not found or path invalid: {init_image_path}"
+        )
+        return
+    # --- End new parameters ---
+
+    if prompt_replacement is not None:
+        prompt = prompt.replace(prompt_replacement[0], prompt_replacement[1])
+        if negative_prompt is not None:
+            negative_prompt = negative_prompt.replace(prompt_replacement[0], prompt_replacement[1])
+
+    if seed is not None:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+    else:
+        # True random sample image generation
+        torch.seed()
+        torch.cuda.seed()
+
+    if negative_prompt is None:
+        negative_prompt = ""
+    height = max(64, height - height % 16)  # round to divisible by 16
+    width = max(64, width - width % 16)  # round to divisible by 16
+    logger.info(f"prompt: {prompt}")
+    if cfg_scale != 1.0:
+        logger.info(f"negative_prompt: {negative_prompt}")
+    elif negative_prompt != "":
+        logger.info(f"negative prompt is ignored because scale is 1.0")
+    logger.info(f"height: {height}")
+    logger.info(f"width: {width}")
+    
+    # --- New logs for Img2Img ---
+    logger.info(f"init_image: {init_image_path}")
+    logger.info(f"denoising_strength: {denoising_strength:.4f}")
+    # --- End new logs ---
+
+    logger.info(f"sample_steps: {sample_steps}")
+    logger.info(f"embedded guidance scale: {emb_guidance_scale}")
+    if cfg_scale != 1.0:
+        logger.info(f"CFG scale: {cfg_scale}")
+    # logger.info(f"sample_sampler: {sampler_name}")
+    if seed is not None:
+        logger.info(f"seed: {seed}")
+
+    # encode prompts
+    tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
+    encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
+
+    def encode_prompt(prpt):
+        text_encoder_conds = []
+        if sample_prompts_te_outputs and prpt in sample_prompts_te_outputs:
+            text_encoder_conds = sample_prompts_te_outputs[prpt]
+            print(f"Using cached text encoder outputs for prompt: {prpt}")
+        if text_encoders is not None:
+            print(f"Encoding prompt: {prpt}")
+            tokens_and_masks = tokenize_strategy.tokenize(prpt)
+            # strategy has apply_t5_attn_mask option
+            encoded_text_encoder_conds = encoding_strategy.encode_tokens(tokenize_strategy, text_encoders, tokens_and_masks)
+
+            # if text_encoder_conds is not cached, use encoded_text_encoder_conds
+            if len(text_encoder_conds) == 0:
+                text_encoder_conds = encoded_text_encoder_conds
+            else:
+                # if encoded_text_encoder_conds is not None, update cached text_encoder_conds
+                for i in range(len(encoded_text_encoder_conds)):
+                    if encoded_text_encoder_conds[i] is not None:
+                        text_encoder_conds[i] = encoded_text_encoder_conds[i]
+        return text_encoder_conds
+
+    l_pooled, t5_out, txt_ids, t5_attn_mask = encode_prompt(prompt)
+    # encode negative prompts
+    if cfg_scale != 1.0:
+        neg_l_pooled, neg_t5_out, _, neg_t5_attn_mask = encode_prompt(negative_prompt)
+        neg_t5_attn_mask = (
+            neg_t5_attn_mask.to(accelerator.device) if args.apply_t5_attn_mask and neg_t5_attn_mask is not None else None
+        )
+        neg_cond = (cfg_scale, neg_l_pooled, neg_t5_out, neg_t5_attn_mask)
+    else:
+        neg_cond = None
+
+    # sample image
+    weight_dtype = ae.dtype  # TOFO give dtype as argument
+
+    # --- VAE Encode Initial Image ---
+    logger.info(f"Loading and encoding init image: {init_image_path}")
+    image = Image.open(init_image_path).convert("RGB")
+    image = image.resize((width, height), Image.LANCZOS)
+    image_tensor = torch.from_numpy((np.array(image) / 127.5) - 1.0)
+    image_tensor = image_tensor.permute(2, 0, 1).unsqueeze(0).to(accelerator.device, dtype=weight_dtype)
+
+    org_vae_device = ae.device
+    ae.to(accelerator.device)
+    with accelerator.autocast(), torch.no_grad():
+        init_latent = ae.encode(image_tensor)  # (B, C, H, W)
+    ae.to(org_vae_device)
+    clean_memory_on_device(accelerator.device)
+
+    # Pack latents from (B, C, H, W) to (B, L, D)
+    init_latent_packed = flux_utils.pack_latents(init_latent)
+    # --- End VAE Encode ---
+
+    packed_latent_height = height // 16
+    packed_latent_width = width // 16
+
+    # --- Create Noised Starting Latent for Img2Img --- # <--- MODIFIED BLOCK ---
+    # Create noise (x1)
+    generator = torch.Generator(device=accelerator.device).manual_seed(seed) if seed is not None else None
+    noise = torch.randn(
+        init_latent_packed.shape,
+        dtype=init_latent_packed.dtype,
+        device=init_latent_packed.device,
+        generator=generator,
+    )
+
+    # Create starting latent x_t = (1-t) * x_0 + t * x_1
+    # where t = denoising_strength, x_0 = init_latent_packed, x_1 = noise
+    start_latent = (1.0 - denoising_strength) * init_latent_packed + denoising_strength * noise
+    # --- END MODIFIED BLOCK ---
+    
+    # Create a schedule from strength -> 0
+    timesteps = torch.linspace(denoising_strength, 0, sample_steps + 1, device=accelerator.device, dtype=weight_dtype)
+    
+    # Apply time shift (same as get_schedule(..., shift=True))
+    image_seq_len = noise.shape[1] # packed_latent_height * packed_latent_width
+    mu = get_lin_function(y1=0.5, y2=1.15)(image_seq_len)
+    timesteps = time_shift(mu, 1.0, timesteps)
+    
+    timesteps = timesteps.tolist()
+    logger.info(f"Img2Img: Running {sample_steps} steps from strength {denoising_strength:.4f} (actual start timestep {timesteps[0]:.4f})")
+    # --- End Timestep Adjustment ---
+    
+    img_ids = flux_utils.prepare_img_ids(1, packed_latent_height, packed_latent_width).to(accelerator.device, weight_dtype)
+    t5_attn_mask = t5_attn_mask.to(accelerator.device) if args.apply_t5_attn_mask else None
+
+    if controlnet_image is not None:
+        controlnet_image = Image.open(controlnet_image).convert("RGB")
+        controlnet_image = controlnet_image.resize((width, height), Image.LANCZOS)
+        controlnet_image = torch.from_numpy((np.array(controlnet_image) / 127.5) - 1)
+        controlnet_image = controlnet_image.permute(2, 0, 1).unsqueeze(0).to(weight_dtype).to(accelerator.device)
+
+    with accelerator.autocast(), torch.no_grad():
+        x = denoise(
+            flux,
+            start_latent,  # <--- Pass the noised latent, not pure noise
+            img_ids,
+            t5_out,
+            txt_ids,
+            l_pooled,
+            timesteps=timesteps,  # <--- Pass the new sliced timesteps
+            guidance=emb_guidance_scale,
+            t5_attn_mask=t5_attn_mask,
+            controlnet=controlnet,
+            controlnet_img=controlnet_image,
+            neg_cond=neg_cond,
+        )
+
+    x = flux_utils.unpack_latents(x, packed_latent_height, packed_latent_width)
+
+    # latent to image
+    clean_memory_on_device(accelerator.device)
+    org_vae_device = ae.device  # will be on cpu
+    ae.to(accelerator.device)  # distributed_state.device is same as accelerator.device
+    with accelerator.autocast(), torch.no_grad():
+        x = ae.decode(x)
+    ae.to(org_vae_device)
+    clean_memory_on_device(accelerator.device)
+
+    x = x.clamp(-1, 1)
+    x = x.permute(0, 2, 3, 1)
+    image = Image.fromarray((127.5 * (x + 1.0)).float().cpu().numpy().astype(np.uint8)[0])
+
+    ts_str = time.strftime("%Y%m%d%H%M%S", time.localtime())
+    num_suffix = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
+    seed_suffix = "" if seed is None else f"_{seed}"
+    i: int = prompt_dict["enum"]
+    
+    # --- Add img2img suffix to filename ---
+    img_filename = f"{'' if args.output_name is None else args.output_name + '_'}img2img_{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png" 
+
+    image.save(os.path.join(save_dir, img_filename))
+
+    # send images to wandb if enabled
+    if "wandb" in [tracker.name for tracker in accelerator.trackers]:
+        wandb_tracker = accelerator.get_tracker("wandb")
+
+        import wandb
+
+        # not to commit images to avoid inconsistency between training and logging steps
+        wandb_tracker.log({f"sample_img2img_{i}": wandb.Image(image, caption=prompt)}, commit=False)
 
 
 def sample_image_inference(

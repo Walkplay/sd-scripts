@@ -6355,6 +6355,16 @@ def line_to_prompt_dict(line: str) -> dict:
                 prompt_dict["flow_shift"] = m.group(1)
                 continue
 
+            m = re.match(r"i (.+)", parg, re.IGNORECASE)
+            if m:  # init image path
+                prompt_dict["init_image"] = m.group(1).strip() # Added strip() to remove potential whitespace
+                continue
+
+            m = re.match(r"ds ([\d\.]+)", parg, re.IGNORECASE)
+            if m:  # denoising strength
+                prompt_dict["denoising_strength"] = float(m.group(1))
+                continue
+
         except ValueError as ex:
             logger.error(f"Exception in parsing / 解析エラー: {parg}")
             logger.error(ex)
