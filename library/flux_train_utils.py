@@ -287,7 +287,23 @@ def sample_img2img_inference(
     packed_latent_height = height // 16
     packed_latent_width = width // 16
 
-    # --- Create Noised Starting Latent for Img2Img --- # <--- MODIFIED BLOCK ---
+    # --- Create Schedule FIRST ---
+    # Create a schedule from strength -> 0
+    timesteps_tensor = torch.linspace(denoising_strength, 0, sample_steps + 1, device=accelerator.device, dtype=weight_dtype)
+    
+    # Apply time shift (same as get_schedule(..., shift=True))
+    image_seq_len = packed_latent_height * packed_latent_width
+    mu = get_lin_function(y1=0.5, y2=1.15)(image_seq_len)
+    timesteps_tensor = time_shift(mu, 1.0, timesteps_tensor)
+    
+    # Get the actual starting sigma (which is the first timestep)
+    start_sigma = timesteps_tensor[0] # Keep as tensor for calculation
+    
+    timesteps = timesteps_tensor.tolist()
+    logger.info(f"Img2Img: Running {sample_steps} steps from strength {denoising_strength:.4f} (actual start sigma {start_sigma.item():.4f})")
+    # --- End Timestep Adjustment ---
+
+    # --- Create Noised Starting Latent for Img2Img ---
     # Create noise (x1)
     generator = torch.Generator(device=accelerator.device).manual_seed(seed) if seed is not None else None
     noise = torch.randn(
@@ -297,22 +313,10 @@ def sample_img2img_inference(
         generator=generator,
     )
 
-    # Create starting latent x_t = (1-t) * x_0 + t * x_1
-    # where t = denoising_strength, x_0 = init_latent_packed, x_1 = noise
-    start_latent = (1.0 - denoising_strength) * init_latent_packed + denoising_strength * noise
+    # Correctly create starting latent x_t = (1-sigma) * x_0 + sigma * x_1
+    # This formula is from the diffusers implementation and is the correct way to add noise
+    start_latent = (1.0 - start_sigma) * init_latent_packed + start_sigma * noise
     # --- END MODIFIED BLOCK ---
-    
-    # Create a schedule from strength -> 0
-    timesteps = torch.linspace(denoising_strength, 0, sample_steps + 1, device=accelerator.device, dtype=weight_dtype)
-    
-    # Apply time shift (same as get_schedule(..., shift=True))
-    image_seq_len = noise.shape[1] # packed_latent_height * packed_latent_width
-    mu = get_lin_function(y1=0.5, y2=1.15)(image_seq_len)
-    timesteps = time_shift(mu, 1.0, timesteps)
-    
-    timesteps = timesteps.tolist()
-    logger.info(f"Img2Img: Running {sample_steps} steps from strength {denoising_strength:.4f} (actual start timestep {timesteps[0]:.4f})")
-    # --- End Timestep Adjustment ---
     
     img_ids = flux_utils.prepare_img_ids(1, packed_latent_height, packed_latent_width).to(accelerator.device, weight_dtype)
     t5_attn_mask = t5_attn_mask.to(accelerator.device) if args.apply_t5_attn_mask else None
@@ -326,7 +330,7 @@ def sample_img2img_inference(
     with accelerator.autocast(), torch.no_grad():
         x = denoise(
             flux,
-            start_latent,  # <--- Pass the noised latent, not pure noise
+            start_latent,  # <--- Pass the correctly noised latent
             img_ids,
             t5_out,
             txt_ids,
